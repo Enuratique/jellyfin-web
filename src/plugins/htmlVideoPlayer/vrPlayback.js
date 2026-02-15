@@ -210,24 +210,34 @@ function configureVideoTexture(THREE, texture) {
     }
 }
 
-function drawIntoEye(ctx, videoElement, source, destination, circularMask) {
+function drawIntoEye(ctx, videoElement, source, destination, circularMask, mirrorX = false) {
     const { sx, sy, sw, sh } = source;
     const { dx, dy, dw, dh } = destination;
 
-    if (!circularMask) {
+    if (!circularMask && !mirrorX) {
         ctx.drawImage(videoElement, sx, sy, sw, sh, dx, dy, dw, dh);
         return;
     }
 
-    const radius = Math.min(dw, dh) * 0.48;
-    const centerX = dx + (dw / 2);
-    const centerY = dy + (dh / 2);
-
     ctx.save();
-    ctx.beginPath();
-    ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(videoElement, sx, sy, sw, sh, dx, dy, dw, dh);
+
+    if (circularMask) {
+        const radius = Math.min(dw, dh) * 0.48;
+        const centerX = dx + (dw / 2);
+        const centerY = dy + (dh / 2);
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        ctx.clip();
+    }
+
+    if (mirrorX) {
+        ctx.translate(dx + dw, dy);
+        ctx.scale(-1, 1);
+        ctx.drawImage(videoElement, sx, sy, sw, sh, 0, 0, dw, dh);
+    } else {
+        ctx.drawImage(videoElement, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
+
     ctx.restore();
 }
 
@@ -535,7 +545,8 @@ export class VrCanvasRenderer {
 
 const MAX_EYE_TEXTURE_SIZE = 2048;
 const IMMERSIVE_HEMISPHERE_PHI_START = Math.PI;
-const IMMERSIVE_SWAP_EYES = true;
+const IMMERSIVE_SWAP_EYES = false;
+const IMMERSIVE_MIRROR_X = true;
 
 function isTopBottomProjection(projection) {
     return projection === VrProjectionId.HalfTopAndBottom
@@ -650,7 +661,8 @@ function drawEyeProjection(ctx, videoElement, projection, isRightEye, width, hei
             dw: width,
             dh: height
         },
-        isFisheyeProjection(projection)
+        isFisheyeProjection(projection),
+        IMMERSIVE_MIRROR_X
     );
 }
 
