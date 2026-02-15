@@ -547,6 +547,7 @@ const MAX_EYE_TEXTURE_SIZE = 2048;
 const IMMERSIVE_HEMISPHERE_PHI_START = Math.PI;
 const IMMERSIVE_SWAP_EYES = false;
 const IMMERSIVE_MIRROR_X = true;
+const IMMERSIVE_RIGHT_ACTION_BUTTON_INDEX = 4;
 
 function isTopBottomProjection(projection) {
     return projection === VrProjectionId.HalfTopAndBottom
@@ -691,6 +692,7 @@ export class VrImmersiveRenderer {
     #exitButton;
     #hasDomOverlay = false;
     #rightEyeCamera;
+    #isRightActionButtonPressed = false;
 
     constructor(container, videoElement, options = {}) {
         this.#container = container;
@@ -857,6 +859,7 @@ export class VrImmersiveRenderer {
         this.#exitButton = null;
         this.#hasDomOverlay = false;
         this.#rightEyeCamera = null;
+        this.#isRightActionButtonPressed = false;
         this.#container = null;
     }
 
@@ -998,6 +1001,7 @@ export class VrImmersiveRenderer {
             return;
         }
 
+        this.#handleRightControllerActionButton();
         this.#updateEyeTextures();
 
         const xrCamera = this.#renderer.xr.getCamera(this.#camera);
@@ -1184,7 +1188,46 @@ export class VrImmersiveRenderer {
         this.#setImmersiveUiVisible(false);
         this.#hasDomOverlay = false;
         this.#rightEyeCamera = null;
+        this.#isRightActionButtonPressed = false;
         this.#session = null;
         this.#isRunning = false;
+    }
+
+    #handleRightControllerActionButton() {
+        const session = this.#session;
+        if (!session) {
+            this.#isRightActionButtonPressed = false;
+            return;
+        }
+
+        const isPressed = Array.from(session.inputSources || []).some((inputSource) => {
+            if (inputSource?.handedness !== 'right') {
+                return false;
+            }
+
+            const buttons = inputSource?.gamepad?.buttons;
+            return !!buttons?.[IMMERSIVE_RIGHT_ACTION_BUTTON_INDEX]?.pressed;
+        });
+
+        if (isPressed && !this.#isRightActionButtonPressed) {
+            this.#togglePlayPauseFromRightController();
+        }
+
+        this.#isRightActionButtonPressed = isPressed;
+    }
+
+    #togglePlayPauseFromRightController() {
+        const videoElement = this.#videoElement;
+        if (!videoElement) {
+            return;
+        }
+
+        if (videoElement.paused) {
+            void videoElement.play().catch(() => {
+                // Ignore user-gesture restrictions and transient playback errors.
+            });
+        } else {
+            videoElement.pause();
+        }
     }
 }
