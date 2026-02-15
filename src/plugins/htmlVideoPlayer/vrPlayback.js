@@ -548,6 +548,23 @@ const IMMERSIVE_HEMISPHERE_PHI_START = Math.PI;
 const IMMERSIVE_SWAP_EYES = false;
 const IMMERSIVE_MIRROR_X = true;
 const IMMERSIVE_RIGHT_ACTION_BUTTON_INDEX = 4;
+const IMMERSIVE_CONTROL_PANEL_CANVAS_WIDTH = 1024;
+const IMMERSIVE_CONTROL_PANEL_CANVAS_HEIGHT = 256;
+const IMMERSIVE_CONTROL_PANEL_WIDTH = 1.8;
+const IMMERSIVE_CONTROL_PANEL_HEIGHT = 0.45;
+const IMMERSIVE_CONTROL_PANEL_DISTANCE = 1.8;
+const IMMERSIVE_CONTROL_PANEL_VERTICAL_OFFSET = -0.35;
+const IMMERSIVE_CONTROL_PANEL_ENTRY_FORWARD_Y = 0.2;
+const IMMERSIVE_CONTROL_PANEL_HIDE_DELAY_MS = 4500;
+const IMMERSIVE_CONTROL_PANEL_FADE_DURATION_MS = 240;
+const IMMERSIVE_CONTROL_PANEL_CORNER_RADIUS = 22;
+const IMMERSIVE_CONTROL_PANEL_PADDING = 24;
+const IMMERSIVE_CONTROL_PANEL_GAP = 16;
+const IMMERSIVE_CONTROL_PANEL_BUTTON_HEIGHT = 84;
+const IMMERSIVE_CONTROL_PANEL_RAY_LENGTH = 6;
+const IMMERSIVE_CONTROL_PANEL_RAY_COLOR_RIGHT = 0x7ecbff;
+const IMMERSIVE_CONTROL_PANEL_RAY_COLOR_LEFT = 0xffcc7e;
+const IMMERSIVE_CONTROL_PANEL_RAY_COLOR_OTHER = 0xffffff;
 
 function isTopBottomProjection(projection) {
     return projection === VrProjectionId.HalfTopAndBottom
@@ -562,6 +579,15 @@ function isMonoProjection(projection) {
 function isFisheyeProjection(projection) {
     return projection === VrProjectionId.FisheyeSideBySide
         || projection === VrProjectionId.FisheyeTopAndBottom;
+}
+
+function hasOpaqueColor(color) {
+    if (!color) {
+        return false;
+    }
+
+    const normalized = String(color).replace(/\s/g, '').toLowerCase();
+    return normalized !== 'transparent' && normalized !== 'rgba(0,0,0,0)';
 }
 
 function getEyeSourceSize(videoElement, projection) {
@@ -693,6 +719,34 @@ export class VrImmersiveRenderer {
     #hasDomOverlay = false;
     #rightEyeCamera;
     #isRightActionButtonPressed = false;
+    #controlPanelMesh;
+    #controlPanelMaterial;
+    #controlPanelTexture;
+    #controlPanelCanvas;
+    #controlPanelContext;
+    #controlPanelButtons = [];
+    #controlPanelHoveredButtonId = null;
+    #isControlPanelVisible = false;
+    #controlPanelHideTimerId = null;
+    #controlPanelOpacity = 0;
+    #controlPanelTargetOpacity = 0;
+    #lastRenderTimeMs = 0;
+    #controlPanelTheme;
+    #lastControlPanelPausedState;
+    #raycaster;
+    #panelWorldPosition;
+    #panelWorldForward;
+    #panelWorldTarget;
+    #panelRayOrigin;
+    #panelRayDirection;
+    #panelRayQuaternion;
+    #panelHeadPosition;
+    #panelRayHitPoint;
+    #controlPanelRayLines = new Map();
+    #controlPanelRayGeometries = new Map();
+    #controlPanelRayMaterials = new Map();
+    #controlPanelRayPositions = new Map();
+    #hasShownControlPanelInSession = false;
 
     constructor(container, videoElement, options = {}) {
         this.#container = container;
@@ -770,6 +824,7 @@ export class VrImmersiveRenderer {
             const session = await this.#requestSession(xr);
             this.#session = session;
             this.#session.addEventListener('end', this.#onSessionEnd);
+            this.#session.addEventListener('select', this.#onSessionSelect);
             this.#hasDomOverlay = !!session.domOverlayState;
 
             await this.#renderer.xr.setSession(session);
@@ -777,6 +832,7 @@ export class VrImmersiveRenderer {
             this.#isRunning = true;
             this.#setImmersiveUiVisible(true);
             this.setProjection(projection);
+            this.#showControlPanel(true);
             return true;
         } catch (error) {
             console.error('[VrImmersiveRenderer] failed to start immersive session', error);
@@ -835,6 +891,32 @@ export class VrImmersiveRenderer {
             this.#immersiveMesh = null;
         }
 
+        if (this.#controlPanelMesh) {
+            this.#scene?.remove(this.#controlPanelMesh);
+        }
+        this.#controlPanelRayLines.forEach((line) => {
+            this.#scene?.remove(line);
+        });
+        this.#controlPanelTexture?.dispose();
+        this.#controlPanelMaterial?.dispose();
+        this.#controlPanelMesh?.geometry?.dispose();
+        this.#controlPanelRayGeometries.forEach((geometry) => {
+            geometry?.dispose();
+        });
+        this.#controlPanelRayMaterials.forEach((material) => {
+            material?.dispose();
+        });
+        this.#controlPanelTexture = null;
+        this.#controlPanelMaterial = null;
+        this.#controlPanelMesh = null;
+        this.#controlPanelRayLines.clear();
+        this.#controlPanelRayGeometries.clear();
+        this.#controlPanelRayMaterials.clear();
+        this.#controlPanelRayPositions.clear();
+        this.#controlPanelCanvas = null;
+        this.#controlPanelContext = null;
+        this.#stopControlPanelHideTimer();
+
         this.#leftTexture?.dispose();
         this.#rightTexture?.dispose();
         this.#leftTexture = null;
@@ -860,6 +942,24 @@ export class VrImmersiveRenderer {
         this.#hasDomOverlay = false;
         this.#rightEyeCamera = null;
         this.#isRightActionButtonPressed = false;
+        this.#controlPanelButtons = [];
+        this.#controlPanelHoveredButtonId = null;
+        this.#isControlPanelVisible = false;
+        this.#controlPanelOpacity = 0;
+        this.#controlPanelTargetOpacity = 0;
+        this.#lastRenderTimeMs = 0;
+        this.#controlPanelTheme = null;
+        this.#lastControlPanelPausedState = null;
+        this.#raycaster = null;
+        this.#panelWorldPosition = null;
+        this.#panelWorldForward = null;
+        this.#panelWorldTarget = null;
+        this.#panelRayOrigin = null;
+        this.#panelRayDirection = null;
+        this.#panelRayQuaternion = null;
+        this.#panelHeadPosition = null;
+        this.#panelRayHitPoint = null;
+        this.#hasShownControlPanelInSession = false;
         this.#container = null;
     }
 
@@ -913,6 +1013,16 @@ export class VrImmersiveRenderer {
         const scene = new THREE.Scene();
         this.#scene = scene;
 
+        this.#raycaster = new THREE.Raycaster();
+        this.#panelWorldPosition = new THREE.Vector3();
+        this.#panelWorldForward = new THREE.Vector3();
+        this.#panelWorldTarget = new THREE.Vector3();
+        this.#panelRayOrigin = new THREE.Vector3();
+        this.#panelRayDirection = new THREE.Vector3();
+        this.#panelRayQuaternion = new THREE.Quaternion();
+        this.#panelHeadPosition = new THREE.Vector3();
+        this.#panelRayHitPoint = new THREE.Vector3();
+
         const camera = new THREE.PerspectiveCamera(90, size.width / size.height, 0.1, 1000);
         camera.position.set(0, 0, 0);
         this.#camera = camera;
@@ -921,6 +1031,7 @@ export class VrImmersiveRenderer {
         this.#hemisphereGeometry = new THREE.SphereGeometry(50, 96, 64, IMMERSIVE_HEMISPHERE_PHI_START, Math.PI, 0, Math.PI);
 
         this.#rebuildVideoTextures();
+        this.#ensureControlPanel();
 
         if (this.#container) {
             this.#container.appendChild(renderer.domElement);
@@ -991,7 +1102,7 @@ export class VrImmersiveRenderer {
         this.setProjection(this.#projection);
     }
 
-    #render = () => {
+    #render = (timeMs, frame) => {
         if (!this.#renderer || !this.#scene || !this.#camera || !this.#isRunning) {
             return;
         }
@@ -1003,6 +1114,9 @@ export class VrImmersiveRenderer {
 
         this.#handleRightControllerActionButton();
         this.#updateEyeTextures();
+        this.#updateControlPanelFade(typeof timeMs === 'number' ? timeMs : performance.now());
+        this.#updateControlPanelInteraction(frame);
+        this.#refreshControlPanelState();
 
         const xrCamera = this.#renderer.xr.getCamera(this.#camera);
         if (xrCamera?.isArrayCamera && xrCamera.cameras?.length >= 2) {
@@ -1120,6 +1234,85 @@ export class VrImmersiveRenderer {
         this.#exitButton?.classList.toggle('hide', !showOverlayUi);
     }
 
+    #ensureControlPanel() {
+        const THREE = this.#three;
+        const scene = this.#scene;
+        if (!THREE || !scene || this.#controlPanelMesh) {
+            return;
+        }
+
+        const panelCanvas = document.createElement('canvas');
+        panelCanvas.width = IMMERSIVE_CONTROL_PANEL_CANVAS_WIDTH;
+        panelCanvas.height = IMMERSIVE_CONTROL_PANEL_CANVAS_HEIGHT;
+        const panelContext = panelCanvas.getContext('2d', { alpha: true });
+        if (!panelContext) {
+            return;
+        }
+
+        const panelTexture = new THREE.CanvasTexture(panelCanvas);
+        panelTexture.minFilter = THREE.LinearFilter;
+        panelTexture.magFilter = THREE.LinearFilter;
+        panelTexture.generateMipmaps = false;
+
+        const panelMaterial = new THREE.MeshBasicMaterial({
+            map: panelTexture,
+            transparent: true,
+            side: THREE.DoubleSide,
+            depthTest: false,
+            depthWrite: false
+        });
+        panelMaterial.opacity = 0;
+
+        const panelGeometry = new THREE.PlaneGeometry(IMMERSIVE_CONTROL_PANEL_WIDTH, IMMERSIVE_CONTROL_PANEL_HEIGHT, 1, 1);
+        const panelMesh = new THREE.Mesh(panelGeometry, panelMaterial);
+        panelMesh.visible = false;
+        panelMesh.renderOrder = 10;
+        scene.add(panelMesh);
+
+        this.#controlPanelCanvas = panelCanvas;
+        this.#controlPanelContext = panelContext;
+        this.#controlPanelTexture = panelTexture;
+        this.#controlPanelMaterial = panelMaterial;
+        this.#controlPanelMesh = panelMesh;
+        this.#controlPanelOpacity = 0;
+        this.#controlPanelTargetOpacity = 0;
+        this.#controlPanelTheme = this.#resolveControlPanelTheme();
+        this.#ensureControlPanelRay('left');
+        this.#ensureControlPanelRay('right');
+        this.#drawControlPanel();
+    }
+
+    #ensureControlPanelRay(handedness) {
+        const THREE = this.#three;
+        const scene = this.#scene;
+        const rayHand = this.#getRayHandKey(handedness);
+        if (!THREE || !scene || this.#controlPanelRayLines.has(rayHand)) {
+            return;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(6);
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+        const material = new THREE.LineBasicMaterial({
+            color: this.#getRayColorForHand(rayHand),
+            transparent: true,
+            opacity: 0.85,
+            depthTest: false,
+            depthWrite: false
+        });
+
+        const line = new THREE.Line(geometry, material);
+        line.visible = false;
+        line.renderOrder = 12;
+        scene.add(line);
+
+        this.#controlPanelRayGeometries.set(rayHand, geometry);
+        this.#controlPanelRayMaterials.set(rayHand, material);
+        this.#controlPanelRayLines.set(rayHand, line);
+        this.#controlPanelRayPositions.set(rayHand, positions);
+    }
+
     #ensureExitButton() {
         if (!this.#container || this.#exitButton) {
             return;
@@ -1136,6 +1329,22 @@ export class VrImmersiveRenderer {
 
     #onExitButtonClick = () => {
         this.stop();
+    };
+
+    #onSessionSelect = (event) => {
+        if (!this.#isControlPanelVisible) {
+            this.#showControlPanel(true);
+            return;
+        }
+
+        const clickedButton = this.#findControlPanelButtonFromSelectEvent(event);
+        if (!clickedButton) {
+            this.#showControlPanel();
+            return;
+        }
+
+        this.#activateControlButton(clickedButton.id);
+        this.#showControlPanel();
     };
 
     #onResize = () => {
@@ -1179,6 +1388,7 @@ export class VrImmersiveRenderer {
 
         if (this.#session) {
             this.#session.removeEventListener('end', this.#onSessionEnd);
+            this.#session.removeEventListener('select', this.#onSessionSelect);
         }
 
         if (this.#renderer) {
@@ -1189,6 +1399,10 @@ export class VrImmersiveRenderer {
         this.#hasDomOverlay = false;
         this.#rightEyeCamera = null;
         this.#isRightActionButtonPressed = false;
+        this.#hideControlPanel(true);
+        this.#stopControlPanelHideTimer();
+        this.#lastRenderTimeMs = 0;
+        this.#hasShownControlPanelInSession = false;
         this.#session = null;
         this.#isRunning = false;
     }
@@ -1228,6 +1442,505 @@ export class VrImmersiveRenderer {
             });
         } else {
             videoElement.pause();
+        }
+
+        this.#showControlPanel();
+    }
+
+    #refreshControlPanelState() {
+        if (!this.#isControlPanelVisible) {
+            return;
+        }
+
+        const paused = !!this.#videoElement?.paused;
+        if (this.#lastControlPanelPausedState !== paused) {
+            this.#drawControlPanel();
+        }
+    }
+
+    #showControlPanel(reposition = false) {
+        if (!this.#controlPanelMesh) {
+            this.#ensureControlPanel();
+        }
+
+        if (!this.#controlPanelMesh || !this.#controlPanelMaterial) {
+            return;
+        }
+
+        const shouldApplyEntryPlacement = !this.#hasShownControlPanelInSession;
+        if (reposition || !this.#isControlPanelVisible) {
+            this.#positionControlPanelInFrontOfViewer(shouldApplyEntryPlacement);
+        }
+
+        this.#isControlPanelVisible = true;
+        this.#hasShownControlPanelInSession = true;
+        this.#controlPanelMesh.visible = true;
+        this.#controlPanelTargetOpacity = 1;
+        this.#drawControlPanel();
+        this.#restartControlPanelHideTimer();
+    }
+
+    #hideControlPanel(immediate = false) {
+        if (!this.#controlPanelMesh || !this.#controlPanelMaterial) {
+            return;
+        }
+
+        if (!immediate && !this.#isControlPanelVisible) {
+            return;
+        }
+
+        this.#isControlPanelVisible = false;
+        this.#controlPanelHoveredButtonId = null;
+        if (immediate) {
+            this.#controlPanelTargetOpacity = 0;
+            this.#controlPanelOpacity = 0;
+            this.#controlPanelMaterial.opacity = 0;
+            this.#controlPanelMesh.visible = false;
+            this.#setAllControlPanelRaysVisible(false);
+            return;
+        }
+
+        this.#controlPanelTargetOpacity = 0;
+    }
+
+    #restartControlPanelHideTimer() {
+        this.#stopControlPanelHideTimer();
+        this.#controlPanelHideTimerId = setTimeout(() => {
+            this.#controlPanelHideTimerId = null;
+            this.#hideControlPanel();
+        }, IMMERSIVE_CONTROL_PANEL_HIDE_DELAY_MS);
+    }
+
+    #stopControlPanelHideTimer() {
+        if (this.#controlPanelHideTimerId != null) {
+            clearTimeout(this.#controlPanelHideTimerId);
+            this.#controlPanelHideTimerId = null;
+        }
+    }
+
+    #updateControlPanelFade(timeMs) {
+        const material = this.#controlPanelMaterial;
+        const mesh = this.#controlPanelMesh;
+        if (!material || !mesh) {
+            return;
+        }
+
+        if (this.#lastRenderTimeMs <= 0) {
+            this.#lastRenderTimeMs = timeMs;
+        }
+
+        const delta = Math.max(0, timeMs - this.#lastRenderTimeMs);
+        this.#lastRenderTimeMs = timeMs;
+
+        if (Math.abs(this.#controlPanelOpacity - this.#controlPanelTargetOpacity) < 0.001) {
+            material.opacity = this.#controlPanelTargetOpacity;
+            this.#controlPanelOpacity = this.#controlPanelTargetOpacity;
+            if (this.#controlPanelTargetOpacity <= 0) {
+                mesh.visible = false;
+                this.#setAllControlPanelRaysVisible(false);
+            }
+            return;
+        }
+
+        const fadeStep = delta / IMMERSIVE_CONTROL_PANEL_FADE_DURATION_MS;
+        if (this.#controlPanelTargetOpacity > this.#controlPanelOpacity) {
+            this.#controlPanelOpacity = Math.min(this.#controlPanelTargetOpacity, this.#controlPanelOpacity + fadeStep);
+        } else {
+            this.#controlPanelOpacity = Math.max(this.#controlPanelTargetOpacity, this.#controlPanelOpacity - fadeStep);
+        }
+
+        if (this.#controlPanelOpacity > 0.001) {
+            mesh.visible = true;
+        }
+
+        material.opacity = this.#controlPanelOpacity;
+    }
+
+    #updateControlPanelInteraction(frame) {
+        if (!this.#isControlPanelVisible || !this.#controlPanelMesh || !this.#controlPanelMesh.visible) {
+            this.#setAllControlPanelRaysVisible(false);
+            this.#setHoveredControlPanelButton(null);
+            return;
+        }
+
+        const inputSources = this.#getTrackedPointerInputSources();
+        if (!inputSources.length || !this.#panelRayHitPoint) {
+            this.#setAllControlPanelRaysVisible(false);
+            this.#setHoveredControlPanelButton(null);
+            return;
+        }
+
+        let hoveredButtonId = null;
+        const activeRayHands = new Set();
+
+        inputSources.forEach((inputSource) => {
+            const rayHand = this.#getRayHandKey(inputSource?.handedness);
+            const hit = this.#findControlPanelHitFromInputSource(inputSource, frame);
+            if (!hit?.origin || !hit?.direction) {
+                this.#setControlPanelRayVisible(rayHand, false);
+                return;
+            }
+
+            const endPoint = hit.point || this.#panelRayHitPoint.copy(hit.origin).addScaledVector(hit.direction, IMMERSIVE_CONTROL_PANEL_RAY_LENGTH);
+            this.#setControlPanelRay(rayHand, hit.origin, endPoint);
+            activeRayHands.add(rayHand);
+
+            if (!hoveredButtonId && hit.button?.id) {
+                hoveredButtonId = hit.button.id;
+            }
+        });
+
+        ['left', 'right', 'other'].forEach((rayHand) => {
+            if (!activeRayHands.has(rayHand)) {
+                this.#setControlPanelRayVisible(rayHand, false);
+            }
+        });
+
+        this.#setHoveredControlPanelButton(hoveredButtonId);
+    }
+
+    #setHoveredControlPanelButton(buttonId) {
+        if (this.#controlPanelHoveredButtonId === buttonId) {
+            return;
+        }
+
+        this.#controlPanelHoveredButtonId = buttonId;
+        this.#drawControlPanel();
+    }
+
+    #getTrackedPointerInputSources() {
+        const session = this.#session;
+        if (!session) {
+            return [];
+        }
+
+        const sources = Array.from(session.inputSources || []);
+        return sources
+            .filter((inputSource) => {
+                if (!inputSource?.targetRaySpace) {
+                    return false;
+                }
+
+                const targetRayMode = inputSource.targetRayMode;
+                if (!targetRayMode) {
+                    return true;
+                }
+
+                if (targetRayMode === 'gaze' || targetRayMode === 'screen') {
+                    return false;
+                }
+
+                return targetRayMode === 'tracked-pointer' || targetRayMode === 'transient-pointer';
+            })
+            .sort((leftSource, rightSource) => {
+                const leftHand = this.#getRayHandKey(leftSource?.handedness);
+                const rightHand = this.#getRayHandKey(rightSource?.handedness);
+                const order = { left: 0, right: 1, other: 2 };
+                return order[leftHand] - order[rightHand];
+            });
+    }
+
+    #getRayHandKey(handedness) {
+        if (handedness === 'left') {
+            return 'left';
+        }
+        if (handedness === 'right') {
+            return 'right';
+        }
+        return 'other';
+    }
+
+    #getRayColorForHand(rayHand) {
+        if (rayHand === 'left') {
+            return IMMERSIVE_CONTROL_PANEL_RAY_COLOR_LEFT;
+        }
+        if (rayHand === 'right') {
+            return IMMERSIVE_CONTROL_PANEL_RAY_COLOR_RIGHT;
+        }
+        return IMMERSIVE_CONTROL_PANEL_RAY_COLOR_OTHER;
+    }
+
+    #setControlPanelRayVisible(rayHand, isVisible) {
+        const line = this.#controlPanelRayLines.get(rayHand);
+        if (!line) {
+            return;
+        }
+
+        line.visible = isVisible;
+    }
+
+    #setAllControlPanelRaysVisible(isVisible) {
+        this.#controlPanelRayLines.forEach((line) => {
+            line.visible = isVisible;
+        });
+    }
+
+    #setControlPanelRay(rayHand, origin, end) {
+        const line = this.#controlPanelRayLines.get(rayHand);
+        const positions = this.#controlPanelRayPositions.get(rayHand);
+        const geometry = this.#controlPanelRayGeometries.get(rayHand);
+        if (!line || !positions || !geometry) {
+            return;
+        }
+
+        positions[0] = origin.x;
+        positions[1] = origin.y;
+        positions[2] = origin.z;
+        positions[3] = end.x;
+        positions[4] = end.y;
+        positions[5] = end.z;
+        geometry.attributes.position.needsUpdate = true;
+        line.visible = true;
+    }
+
+    #positionControlPanelInFrontOfViewer(useEntryPlacement = false) {
+        const mesh = this.#controlPanelMesh;
+        const renderer = this.#renderer;
+        const camera = this.#camera;
+        if (!mesh || !renderer || !camera || !this.#panelWorldPosition || !this.#panelWorldForward || !this.#panelWorldTarget || !this.#panelHeadPosition) {
+            return;
+        }
+
+        const xrCamera = renderer.xr.getCamera(camera);
+        if (!xrCamera) {
+            return;
+        }
+
+        xrCamera.getWorldPosition(this.#panelWorldPosition);
+        xrCamera.getWorldDirection(this.#panelWorldForward);
+        if (useEntryPlacement) {
+            this.#panelWorldForward.y = Math.max(this.#panelWorldForward.y, IMMERSIVE_CONTROL_PANEL_ENTRY_FORWARD_Y);
+        } else {
+            this.#panelWorldForward.y = 0;
+        }
+        if (this.#panelWorldForward.lengthSq() < 1e-6) {
+            this.#panelWorldForward.set(0, useEntryPlacement ? IMMERSIVE_CONTROL_PANEL_ENTRY_FORWARD_Y : 0, -1);
+        } else {
+            this.#panelWorldForward.normalize();
+        }
+
+        mesh.position.copy(this.#panelWorldPosition)
+            .addScaledVector(this.#panelWorldForward, IMMERSIVE_CONTROL_PANEL_DISTANCE);
+        mesh.position.y += IMMERSIVE_CONTROL_PANEL_VERTICAL_OFFSET;
+
+        this.#panelHeadPosition.copy(this.#panelWorldPosition);
+        this.#panelHeadPosition.y += IMMERSIVE_CONTROL_PANEL_VERTICAL_OFFSET * 0.5;
+        this.#panelWorldTarget.copy(this.#panelHeadPosition).sub(this.#panelWorldForward);
+        mesh.lookAt(this.#panelWorldTarget);
+    }
+
+    #resolveControlPanelTheme() {
+        const controlsElement = document.querySelector('#videoOsdPage .videoOsdBottom .osdControls')
+            || document.querySelector('.videoOsdBottom .osdControls');
+        const buttonElement = document.querySelector('#videoOsdPage .videoOsdBottom .paper-icon-button-light')
+            || document.querySelector('.videoOsdBottom .paper-icon-button-light');
+        const controlsStyle = controlsElement ? getComputedStyle(controlsElement) : null;
+        const buttonStyle = buttonElement ? getComputedStyle(buttonElement) : null;
+
+        const panelBackground = hasOpaqueColor(controlsStyle?.backgroundColor) ? controlsStyle.backgroundColor : 'rgba(12, 12, 12, 0.78)';
+        const panelBorder = hasOpaqueColor(controlsStyle?.borderColor) ? controlsStyle.borderColor : 'rgba(255, 255, 255, 0.18)';
+        const textColor = hasOpaqueColor(controlsStyle?.color) ? controlsStyle.color : '#f3f3f3';
+        const buttonBackground = hasOpaqueColor(buttonStyle?.backgroundColor) ? buttonStyle.backgroundColor : 'rgba(255, 255, 255, 0.08)';
+        const buttonTextColor = hasOpaqueColor(buttonStyle?.color) ? buttonStyle.color : textColor;
+        const fontFamily = controlsStyle?.fontFamily || buttonStyle?.fontFamily || 'sans-serif';
+        const hoverBackground = 'rgba(255, 255, 255, 0.18)';
+
+        return {
+            panelBackground,
+            panelBorder,
+            textColor,
+            buttonBackground,
+            buttonTextColor,
+            fontFamily,
+            hoverBackground
+        };
+    }
+
+    #drawControlPanel() {
+        const ctx = this.#controlPanelContext;
+        const canvas = this.#controlPanelCanvas;
+        const texture = this.#controlPanelTexture;
+        if (!ctx || !canvas || !texture) {
+            return;
+        }
+
+        this.#controlPanelTheme = this.#resolveControlPanelTheme();
+        const theme = this.#controlPanelTheme;
+        const width = canvas.width;
+        const height = canvas.height;
+        const outerRadius = IMMERSIVE_CONTROL_PANEL_CORNER_RADIUS;
+
+        ctx.clearRect(0, 0, width, height);
+
+        ctx.fillStyle = theme.panelBackground;
+        ctx.strokeStyle = theme.panelBorder;
+        ctx.lineWidth = 2;
+        this.#drawRoundedRect(ctx, 1, 1, width - 2, height - 2, outerRadius);
+        ctx.fill();
+        ctx.stroke();
+
+        const buttons = this.#buildControlPanelButtons(width, height);
+        this.#controlPanelButtons = buttons;
+        this.#lastControlPanelPausedState = !!this.#videoElement?.paused;
+
+        ctx.font = `600 32px ${theme.fontFamily}`;
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'center';
+        const hoveredButtonId = this.#controlPanelHoveredButtonId ? String(this.#controlPanelHoveredButtonId) : '';
+
+        buttons.forEach((button) => {
+            const isHovered = hoveredButtonId === String(button.id);
+            ctx.fillStyle = isHovered ? theme.hoverBackground : theme.buttonBackground;
+            this.#drawRoundedRect(ctx, button.x, button.y, button.width, button.height, 14);
+            ctx.fill();
+
+            ctx.fillStyle = theme.buttonTextColor;
+            ctx.fillText(button.label, button.x + (button.width / 2), button.y + (button.height / 2));
+        });
+
+        texture.needsUpdate = true;
+    }
+
+    #buildControlPanelButtons(canvasWidth, canvasHeight) {
+        const videoElement = this.#videoElement;
+        const isPaused = !!videoElement?.paused;
+        const specs = [
+            { id: 'rewind', label: '-10s' },
+            { id: 'playpause', label: isPaused ? 'Play' : 'Pause' },
+            { id: 'forward', label: '+10s' },
+            { id: 'volumeDown', label: 'Vol-' },
+            { id: 'volumeUp', label: 'Vol+' },
+            { id: 'settings', label: 'Settings' },
+            { id: 'exit', label: 'Exit VR' }
+        ];
+
+        const paddedWidth = canvasWidth - (IMMERSIVE_CONTROL_PANEL_PADDING * 2);
+        const totalGap = (specs.length - 1) * IMMERSIVE_CONTROL_PANEL_GAP;
+        const buttonWidth = Math.floor((paddedWidth - totalGap) / specs.length);
+        const xOffset = Math.floor((canvasWidth - ((buttonWidth * specs.length) + totalGap)) / 2);
+        const y = Math.floor((canvasHeight - IMMERSIVE_CONTROL_PANEL_BUTTON_HEIGHT) / 2);
+
+        return specs.map((spec, index) => ({
+            ...spec,
+            x: xOffset + (index * (buttonWidth + IMMERSIVE_CONTROL_PANEL_GAP)),
+            y,
+            width: buttonWidth,
+            height: IMMERSIVE_CONTROL_PANEL_BUTTON_HEIGHT
+        }));
+    }
+
+    #drawRoundedRect(ctx, x, y, width, height, radius) {
+        const clampedRadius = Math.max(0, Math.min(radius, Math.min(width, height) / 2));
+        ctx.beginPath();
+        ctx.moveTo(x + clampedRadius, y);
+        ctx.lineTo(x + width - clampedRadius, y);
+        ctx.quadraticCurveTo(x + width, y, x + width, y + clampedRadius);
+        ctx.lineTo(x + width, y + height - clampedRadius);
+        ctx.quadraticCurveTo(x + width, y + height, x + width - clampedRadius, y + height);
+        ctx.lineTo(x + clampedRadius, y + height);
+        ctx.quadraticCurveTo(x, y + height, x, y + height - clampedRadius);
+        ctx.lineTo(x, y + clampedRadius);
+        ctx.quadraticCurveTo(x, y, x + clampedRadius, y);
+        ctx.closePath();
+    }
+
+    #findControlPanelButtonFromSelectEvent(event) {
+        if (!event?.inputSource || !event?.frame) {
+            return null;
+        }
+
+        const hit = this.#findControlPanelHitFromInputSource(event.inputSource, event.frame);
+        if (!hit) {
+            return null;
+        }
+
+        this.#setHoveredControlPanelButton(hit.button?.id || null);
+        return hit.button || null;
+    }
+
+    #findControlPanelHitFromInputSource(inputSource, frame) {
+        const mesh = this.#controlPanelMesh;
+        const raycaster = this.#raycaster;
+        const renderer = this.#renderer;
+        const canvas = this.#controlPanelCanvas;
+        if (!mesh || !raycaster || !renderer || !canvas || !this.#panelRayOrigin || !this.#panelRayDirection || !this.#panelRayQuaternion || !inputSource?.targetRaySpace || !frame) {
+            return null;
+        }
+
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        if (!referenceSpace) {
+            return null;
+        }
+
+        const pose = frame.getPose(inputSource.targetRaySpace, referenceSpace);
+        if (!pose) {
+            return null;
+        }
+
+        const { position, orientation } = pose.transform;
+        this.#panelRayOrigin.set(position.x, position.y, position.z);
+        this.#panelRayQuaternion.set(orientation.x, orientation.y, orientation.z, orientation.w);
+        this.#panelRayDirection.set(0, 0, -1).applyQuaternion(this.#panelRayQuaternion).normalize();
+
+        raycaster.set(this.#panelRayOrigin, this.#panelRayDirection);
+        const hit = raycaster.intersectObject(mesh, false)[0];
+        if (!hit?.uv) {
+            return {
+                button: null,
+                point: null,
+                origin: this.#panelRayOrigin,
+                direction: this.#panelRayDirection
+            };
+        }
+
+        const x = hit.uv.x * canvas.width;
+        const y = (1 - hit.uv.y) * canvas.height;
+        const button = this.#controlPanelButtons.find((item) =>
+            x >= item.x
+            && x <= (item.x + item.width)
+            && y >= item.y
+            && y <= (item.y + item.height));
+
+        return {
+            button: button || null,
+            point: hit.point || null,
+            origin: this.#panelRayOrigin,
+            direction: this.#panelRayDirection
+        };
+    }
+
+    #activateControlButton(buttonId) {
+        const videoElement = this.#videoElement;
+        if (!videoElement) {
+            return;
+        }
+
+        switch (buttonId) {
+            case 'rewind':
+                videoElement.currentTime = Math.max(0, (videoElement.currentTime || 0) - 10);
+                break;
+            case 'playpause':
+                this.#togglePlayPauseFromRightController();
+                break;
+            case 'forward': {
+                const duration = Number.isFinite(videoElement.duration) ? videoElement.duration : Infinity;
+                videoElement.currentTime = Math.min(duration, (videoElement.currentTime || 0) + 10);
+                break;
+            }
+            case 'volumeDown':
+                videoElement.volume = Math.max(0, (videoElement.volume || 0) - 0.1);
+                break;
+            case 'volumeUp':
+                videoElement.volume = Math.min(1, (videoElement.volume || 0) + 0.1);
+                break;
+            case 'settings':
+                document.querySelector('#videoOsdPage .btnVideoOsdSettings')?.click();
+                break;
+            case 'exit':
+                void this.stop();
+                break;
+            default:
+                break;
         }
     }
 }
