@@ -13,7 +13,9 @@
 
 	// Use 'postCreateCommand' to run commands after the container is created.
 	//https://github.com/microsoft/vscode-dev-containers/issues/559
-	"postCreateCommand": "source $NVM_DIR/nvm.sh && nvm install 24"
+	//"postCreateCommand": "source $NVM_DIR/nvm.sh && nvm install 24"
+	"postCreateCommand": "bash -lc 'source \"$NVM_DIR/nvm.sh\" || true; nvm install 24'"
+
 
 	// Configure tool-specific properties.
 	// "customizations": {},
